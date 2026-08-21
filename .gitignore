@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+.dotnet-cli-home/
+glasscard-ab-test/
+glasscard-overlay-test/
+artifacts/
