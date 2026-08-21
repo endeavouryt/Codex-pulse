@@ -59,6 +59,16 @@ internal static class NativeMethods
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
     private static extern int SetWindowLong32(IntPtr hwnd, int index, int value);
 
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetLastInputInfo(ref LastInputInfo lastInputInfo);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(
@@ -107,6 +117,42 @@ internal static class NativeMethods
         return IntPtr.Size == 8
             ? SetWindowLongPtr64(hwnd, index, value)
             : new IntPtr(SetWindowLong32(hwnd, index, value.ToInt32()));
+    }
+
+    public static int? GetForegroundProcessId()
+    {
+        var hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero || GetWindowThreadProcessId(hwnd, out var processId) == 0 || processId == 0)
+        {
+            return null;
+        }
+
+        return checked((int)processId);
+    }
+
+    public static bool HasRecentUserInput(TimeSpan threshold)
+    {
+        var lastInputUtc = GetLastUserInputUtc();
+        return lastInputUtc.HasValue &&
+               threshold > TimeSpan.Zero &&
+               DateTimeOffset.UtcNow - lastInputUtc.Value <= threshold;
+    }
+
+    public static DateTimeOffset? GetLastUserInputUtc()
+    {
+        var lastInputInfo = new LastInputInfo
+        {
+            Size = (uint)Marshal.SizeOf<LastInputInfo>()
+        };
+        if (!GetLastInputInfo(ref lastInputInfo))
+        {
+            return null;
+        }
+
+        // LASTINPUTINFO stores the low 32 bits of the system tick count. The
+        // unchecked subtraction also handles the normal 32-bit wraparound.
+        var elapsedMilliseconds = unchecked((uint)Environment.TickCount64 - lastInputInfo.Time);
+        return DateTimeOffset.UtcNow - TimeSpan.FromMilliseconds(elapsedMilliseconds);
     }
 
     public static void ApplyWindows11Backdrop(IntPtr hwnd)
@@ -251,5 +297,12 @@ internal static class NativeMethods
         public int AccentFlags;
         public uint GradientColor;
         public int AnimationId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LastInputInfo
+    {
+        public uint Size;
+        public uint Time;
     }
 }

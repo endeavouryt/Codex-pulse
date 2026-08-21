@@ -10,6 +10,8 @@ public enum PulseStatus
 public sealed class SessionObservation
 {
     public string SessionId { get; init; } = string.Empty;
+    public string? ParentSessionId { get; init; }
+    public DateTimeOffset? CreatedAt { get; init; }
     public PulseStatus Status { get; init; } = PulseStatus.Idle;
     public DateTimeOffset? StatusAt { get; init; }
     public DateTimeOffset LastActivityAt { get; init; }
@@ -17,6 +19,8 @@ public sealed class SessionObservation
     public double? ContextRemainingPercent { get; init; }
     public string SourceName { get; init; } = string.Empty;
     public string? Detail { get; init; }
+
+    public bool IsRoot => string.IsNullOrWhiteSpace(ParentSessionId);
 }
 
 public sealed class ProviderObservation

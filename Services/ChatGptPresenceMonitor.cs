@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.IO;
 using System.Windows.Threading;
+using CodexPulse.Interop;
 
 namespace CodexPulse.Services;
 
 internal sealed class ChatGptPresenceMonitor : IDisposable
 {
+    private static readonly TimeSpan RecentUserInputWindow = TimeSpan.FromSeconds(5);
     private readonly DispatcherTimer _timer;
     private bool? _lastPresence;
     private bool _started;
@@ -22,6 +24,10 @@ internal sealed class ChatGptPresenceMonitor : IDisposable
     public event EventHandler<bool>? PresenceChanged;
 
     public bool IsRunning { get; private set; }
+    public bool IsFocused { get; private set; }
+    public int? FocusedProcessId { get; private set; }
+    public bool UserInputRecently { get; private set; }
+    public DateTimeOffset? LastUserInputUtc { get; private set; }
 
     public void Start()
     {
@@ -48,8 +54,19 @@ internal sealed class ChatGptPresenceMonitor : IDisposable
 
     private void Refresh()
     {
-        var isRunning = IsChatGptProcessRunning();
+        var processNames = GetConfiguredProcessNames();
+        var isRunning = IsChatGptProcessRunning(processNames);
+        var foregroundProcessId = NativeMethods.GetForegroundProcessId();
+        var isFocused = foregroundProcessId.HasValue &&
+                        IsConfiguredChatGptProcess(foregroundProcessId.Value, processNames);
+
         IsRunning = isRunning;
+        IsFocused = isFocused;
+        FocusedProcessId = isFocused ? foregroundProcessId : null;
+        var lastUserInputUtc = isFocused ? NativeMethods.GetLastUserInputUtc() : null;
+        UserInputRecently = lastUserInputUtc.HasValue &&
+                            DateTimeOffset.UtcNow - lastUserInputUtc.Value <= RecentUserInputWindow;
+        LastUserInputUtc = UserInputRecently ? lastUserInputUtc : null;
         if (_lastPresence == isRunning)
         {
             return;
@@ -59,18 +76,8 @@ internal sealed class ChatGptPresenceMonitor : IDisposable
         PresenceChanged?.Invoke(this, isRunning);
     }
 
-    private static bool IsChatGptProcessRunning()
+    private static bool IsChatGptProcessRunning(IReadOnlyList<string> processNames)
     {
-        var configuredNames = Environment.GetEnvironmentVariable("CODEX_PULSE_CHATGPT_PROCESS_NAMES");
-        var processNames = string.IsNullOrWhiteSpace(configuredNames)
-            ? new[] { "ChatGPT", "ChatGPTDesktop" }
-            : configuredNames
-                .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(name => Path.GetFileNameWithoutExtension(name))
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-
         foreach (var processName in processNames)
         {
             try
@@ -93,6 +100,33 @@ internal sealed class ChatGptPresenceMonitor : IDisposable
         }
 
         return false;
+    }
+
+    private static bool IsConfiguredChatGptProcess(int processId, IReadOnlyList<string> processNames)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return processNames.Any(name =>
+                string.Equals(process.ProcessName, name, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static IReadOnlyList<string> GetConfiguredProcessNames()
+    {
+        var configuredNames = Environment.GetEnvironmentVariable("CODEX_PULSE_CHATGPT_PROCESS_NAMES");
+        return string.IsNullOrWhiteSpace(configuredNames)
+            ? new[] { "ChatGPT", "ChatGPTDesktop" }
+            : configuredNames
+                .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(name => Path.GetFileNameWithoutExtension(name))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
     }
 
     public void Dispose()

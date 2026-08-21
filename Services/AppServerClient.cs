@@ -91,11 +91,11 @@ internal sealed class AppServerClient : IDisposable
                         {
                             name = "codex_pulse",
                             title = "Codex Pulse",
-                            version = "0.1.0"
+                            version = "0.1.1"
                         },
                         capabilities = new
                         {
-                            experimentalApi = false
+                            experimentalApi = true
                         }
                     },
                     cancellationToken).ConfigureAwait(false);

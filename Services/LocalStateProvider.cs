@@ -8,6 +8,8 @@ namespace CodexPulse.Services;
 internal sealed class LocalStateProvider
 {
     private const int MaxTailBytes = 1024 * 1024;
+    private const int MetadataProbeBytes = 64 * 1024;
+    private const int MaxPreferredSessionFiles = 64;
     private static readonly TimeSpan CompletedDisplayWindow = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StaleActiveWindow = TimeSpan.FromMinutes(30);
     private readonly Func<IEnumerable<string>> _codexHomeProvider;
@@ -17,14 +19,21 @@ internal sealed class LocalStateProvider
         _codexHomeProvider = codexHomeProvider;
     }
 
-    public Task<ProviderObservation> ReadAsync(CancellationToken cancellationToken)
+    public Task<ProviderObservation> ReadAsync(
+        CancellationToken cancellationToken,
+        string? preferredSessionId = null)
     {
-        return Task.Run(() => ReadSynchronously(cancellationToken), cancellationToken);
+        return Task.Run(
+            () => ReadSynchronously(cancellationToken, preferredSessionId),
+            cancellationToken);
     }
 
-    private ProviderObservation ReadSynchronously(CancellationToken cancellationToken)
+    private ProviderObservation ReadSynchronously(
+        CancellationToken cancellationToken,
+        string? preferredSessionId)
     {
         var files = new List<FileInfo>();
+        var preferredFilePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var home in _codexHomeProvider().Distinct(StringComparer.OrdinalIgnoreCase))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -40,6 +49,18 @@ internal sealed class LocalStateProvider
                     .EnumerateFiles("rollout-*.jsonl", SearchOption.AllDirectories)
                     .OrderByDescending(file => file.LastWriteTimeUtc)
                     .Take(24));
+
+                if (IsSessionId(preferredSessionId))
+                {
+                    foreach (var file in ReadPreferredSessionGraphFiles(
+                                 sessionsDirectory,
+                                 preferredSessionId!,
+                                 cancellationToken))
+                    {
+                        files.Add(file);
+                        preferredFilePaths.Add(file.FullName);
+                    }
+                }
             }
             catch (IOException)
             {
@@ -52,11 +73,26 @@ internal sealed class LocalStateProvider
         }
 
         var observations = new List<LocalFileObservation>();
-        foreach (var file in files
-                     .GroupBy(item => item.FullName, StringComparer.OrdinalIgnoreCase)
-                     .Select(group => group.First())
-                     .OrderByDescending(item => item.LastWriteTimeUtc)
-                     .Take(32))
+        var uniqueFiles = files
+            .GroupBy(item => item.FullName, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+        var prioritizedFiles = uniqueFiles
+            .Where(file => preferredFilePaths.Contains(file.FullName) ||
+                           string.Equals(
+                               ExtractSessionId(file.Name),
+                               preferredSessionId,
+                               StringComparison.OrdinalIgnoreCase))
+            .Concat(uniqueFiles
+                .Where(file => !preferredFilePaths.Contains(file.FullName) &&
+                               !string.Equals(
+                                   ExtractSessionId(file.Name),
+                                   preferredSessionId,
+                                   StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(item => item.LastWriteTimeUtc))
+            .Take(IsSessionId(preferredSessionId) ? MaxPreferredSessionFiles : 32);
+
+        foreach (var file in prioritizedFiles)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var observation = ReadFile(file, cancellationToken);
@@ -66,7 +102,8 @@ internal sealed class LocalStateProvider
             }
         }
 
-        if (observations.Count == 0)
+        var sessionObservations = CollapseDuplicateSessions(observations);
+        if (sessionObservations.Count == 0)
         {
             return new ProviderObservation
             {
@@ -76,21 +113,21 @@ internal sealed class LocalStateProvider
             };
         }
 
-        var active = observations
+        var active = sessionObservations
             .Where(item => item.Status == PulseStatus.Working)
             .OrderByDescending(item => item.LastActivityAt)
             .FirstOrDefault();
-        var recentCompleted = observations
+        var recentCompleted = sessionObservations
             .Where(item => item.Status == PulseStatus.Completed)
             .OrderByDescending(item => item.StatusAt ?? item.LastActivityAt)
             .FirstOrDefault();
         var metricObservation = (active is not null &&
                                  (active.ContextRemainingPercent.HasValue || active.QuotaRemainingPercent.HasValue)
                 ? active
-                : observations
+                : sessionObservations
                 .Where(item => item.ContextRemainingPercent.HasValue || item.QuotaRemainingPercent.HasValue)
                 .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
-                .FirstOrDefault()) ?? observations.OrderByDescending(item => item.LastActivityAt).First();
+                .FirstOrDefault()) ?? sessionObservations.OrderByDescending(item => item.LastActivityAt).First();
 
         var statusObservation = active ?? recentCompleted;
         var status = statusObservation?.Status ?? PulseStatus.Idle;
@@ -116,10 +153,11 @@ internal sealed class LocalStateProvider
             LastUpdatedAt = metricObservation.LastActivityAt,
             SourceName = "local session",
             Detail = detail,
-            Sessions = observations
+            Sessions = sessionObservations
                 .Select(item => new SessionObservation
                 {
                     SessionId = item.SessionId,
+                    ParentSessionId = item.ParentSessionId,
                     Status = item.Status,
                     StatusAt = item.StatusAt,
                     LastActivityAt = item.LastActivityAt,
@@ -132,6 +170,153 @@ internal sealed class LocalStateProvider
         };
     }
 
+    private static IReadOnlyList<LocalFileObservation> CollapseDuplicateSessions(
+        IReadOnlyList<LocalFileObservation> observations)
+    {
+        return observations
+            .Where(item => !string.IsNullOrWhiteSpace(item.SessionId))
+            .GroupBy(item => item.SessionId, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var items = group.ToArray();
+                var latestStatus = items
+                    .OrderByDescending(item => item.StatusAt ?? item.LastActivityAt)
+                    .First();
+                var latestContext = items
+                    .Where(item => item.ContextRemainingPercent.HasValue)
+                    .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
+                    .FirstOrDefault();
+                var latestQuota = items
+                    .Where(item => item.QuotaRemainingPercent.HasValue)
+                    .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
+                    .FirstOrDefault();
+                var latestWork = items
+                    .Where(item => item.WorkStartedAt.HasValue)
+                    .OrderByDescending(item => item.WorkStartedAt)
+                    .FirstOrDefault();
+
+                return new LocalFileObservation
+                {
+                    FileName = (latestContext ?? latestQuota ?? latestStatus).FileName,
+                    SessionId = group.Key,
+                    ParentSessionId = items
+                        .Select(item => item.ParentSessionId)
+                        .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)),
+                    LastActivityAt = items.Max(item => item.LastActivityAt),
+                    LastTokenAt = items
+                        .Where(item => item.LastTokenAt.HasValue)
+                        .Select(item => item.LastTokenAt)
+                        .OrderByDescending(value => value)
+                        .FirstOrDefault(),
+                    WorkStartedAt = latestWork?.WorkStartedAt,
+                    ContextRemainingPercent = latestContext?.ContextRemainingPercent,
+                    QuotaRemainingPercent = latestQuota?.QuotaRemainingPercent,
+                    Status = latestStatus.Status,
+                    StatusAt = latestStatus.StatusAt
+                };
+            })
+            .OrderByDescending(item => item.WorkStartedAt ?? item.StatusAt ?? item.LastActivityAt)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<FileInfo> ReadPreferredSessionGraphFiles(
+        string sessionsDirectory,
+        string preferredSessionId,
+        CancellationToken cancellationToken)
+    {
+        var files = new List<SessionMetadata>();
+        try
+        {
+            foreach (var file in new DirectoryInfo(sessionsDirectory)
+                         .EnumerateFiles("rollout-*.jsonl", SearchOption.AllDirectories))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                files.Add(ReadSessionMetadata(file, cancellationToken));
+            }
+        }
+        catch (IOException)
+        {
+            return Array.Empty<FileInfo>();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Array.Empty<FileInfo>();
+        }
+
+        var selectedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            preferredSessionId
+        };
+
+        // Include ancestors so a focus hint that points at a descendant still
+        // resolves back to its root thread.
+        var ancestor = files.FirstOrDefault(item =>
+            string.Equals(item.SessionId, preferredSessionId, StringComparison.OrdinalIgnoreCase));
+        while (ancestor is not null && !string.IsNullOrWhiteSpace(ancestor.ParentSessionId) &&
+               selectedIds.Add(ancestor.ParentSessionId!))
+        {
+            ancestor = files.FirstOrDefault(item =>
+                string.Equals(item.SessionId, ancestor.ParentSessionId, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // Then include every direct or nested descendant of the selected root.
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var metadata in files)
+            {
+                if (!string.IsNullOrWhiteSpace(metadata.ParentSessionId) &&
+                    selectedIds.Contains(metadata.ParentSessionId) &&
+                    selectedIds.Add(metadata.SessionId))
+                {
+                    changed = true;
+                }
+            }
+        }
+
+        return files
+            .Where(item => selectedIds.Contains(item.SessionId))
+            .Select(item => item.File)
+            .ToArray();
+    }
+
+    private static SessionMetadata ReadSessionMetadata(
+        FileInfo file,
+        CancellationToken cancellationToken)
+    {
+        var sessionId = ExtractSessionId(file.Name);
+        string? parentSessionId = null;
+        foreach (var line in ReadHeadLines(file.FullName))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                var root = document.RootElement;
+                if (!string.Equals(
+                        JsonHelpers.TryGetString(root, "type"),
+                        "session_meta",
+                        StringComparison.OrdinalIgnoreCase) ||
+                    !JsonHelpers.TryGetProperty(root, out var payload, "payload") ||
+                    payload.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                sessionId = JsonHelpers.TryGetString(payload, "id", "threadId", "thread_id") ?? sessionId;
+                parentSessionId = JsonHelpers.TryGetString(payload, "parentThreadId", "parent_thread_id");
+                break;
+            }
+            catch (JsonException)
+            {
+                // Ignore an incomplete first line and continue probing.
+            }
+        }
+
+        return new SessionMetadata(file, sessionId, parentSessionId);
+    }
+
     private static LocalFileObservation? ReadFile(FileInfo file, CancellationToken cancellationToken)
     {
         try
@@ -139,6 +324,8 @@ internal sealed class LocalStateProvider
             var taskStartedAt = default(DateTimeOffset?);
             var taskCompletedAt = default(DateTimeOffset?);
             var lastTokenAt = default(DateTimeOffset?);
+            var sessionId = ExtractSessionId(file.Name);
+            string? parentThreadId = null;
             double? contextRemaining = null;
             double? quotaRemaining = null;
             var lastActivityAt = new DateTimeOffset(file.LastWriteTimeUtc);
@@ -162,9 +349,20 @@ internal sealed class LocalStateProvider
                     }
 
                     var eventType = JsonHelpers.TryGetString(root, "type");
-                    if (!string.Equals(eventType, "event_msg", StringComparison.Ordinal) ||
-                        !JsonHelpers.TryGetProperty(root, out var payload, "payload") ||
+                    if (!JsonHelpers.TryGetProperty(root, out var payload, "payload") ||
                         payload.ValueKind != JsonValueKind.Object)
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(eventType, "session_meta", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sessionId = JsonHelpers.TryGetString(payload, "id", "threadId", "thread_id") ?? sessionId;
+                        parentThreadId = JsonHelpers.TryGetString(payload, "parentThreadId", "parent_thread_id");
+                        continue;
+                    }
+
+                    if (!string.Equals(eventType, "event_msg", StringComparison.Ordinal))
                     {
                         continue;
                     }
@@ -229,7 +427,8 @@ internal sealed class LocalStateProvider
             return new LocalFileObservation
             {
                 FileName = file.Name,
-                SessionId = ExtractSessionId(file.Name),
+                SessionId = sessionId,
+                ParentSessionId = parentThreadId,
                 LastActivityAt = lastActivityAt,
                 LastTokenAt = lastTokenAt,
                 WorkStartedAt = taskStartedAt,
@@ -335,10 +534,54 @@ internal sealed class LocalStateProvider
         return stem;
     }
 
+    private static IEnumerable<string> ReadHeadLines(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var length = checked((int)Math.Min(MetadataProbeBytes, stream.Length));
+            var bytes = new byte[length];
+            var read = 0;
+            while (read < bytes.Length)
+            {
+                var current = stream.Read(bytes, read, bytes.Length - read);
+                if (current == 0)
+                {
+                    break;
+                }
+
+                read += current;
+            }
+
+            return Encoding.UTF8
+                .GetString(bytes, 0, read)
+                .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+        catch (IOException)
+        {
+            return Array.Empty<string>();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Array.Empty<string>();
+        }
+    }
+
+    private static bool IsSessionId(string? sessionId)
+    {
+        return Guid.TryParse(sessionId, out _);
+    }
+
+    private sealed record SessionMetadata(
+        FileInfo File,
+        string SessionId,
+        string? ParentSessionId);
+
     private sealed class LocalFileObservation
     {
         public string FileName { get; init; } = string.Empty;
         public string SessionId { get; init; } = string.Empty;
+        public string? ParentSessionId { get; init; }
         public DateTimeOffset LastActivityAt { get; init; }
         public DateTimeOffset? LastTokenAt { get; init; }
         public DateTimeOffset? WorkStartedAt { get; init; }

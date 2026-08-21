@@ -30,7 +30,7 @@ $env:CODEX_PULSE_CODEX_PATH = 'C:\path\to\codex.exe'
 
 1. 优先启动 `codex app-server --stdio`，使用 JSONL 请求 `initialize`、`account/rateLimits/read`、`account/usage/read` 和 `thread/list`。
 2. app-server 没有返回某项数据时，读取 `%USERPROFILE%\.codex\sessions\**\rollout-*.jsonl` 的尾部事件，解析 `event_msg/token_count`、`task_started` 和 `task_complete`。
-3. CTX 候选按 thread/session 标识合并；默认自动跟随最近开始工作的会话。没有工作时保持当前会话，不会把多个会话合并到 CTX。QTA 仍按账号级 rate-limit 数据读取。
+3. CTX 候选按 thread/session 标识合并，并依据 app-server 的 `parentThreadId` 收敛到 root thread；Pulse 不会把 subagent thread 作为监控对象。root 自身或其正在工作的 descendant 会显示工作状态，但 CTX 始终只读取 root thread。ChatGPT 窗口聚焦时优先跟随用户当前选中的 root，仅接受与真实用户输入相邻的直接会话切换信号，后台 subagent stream 不会抢占监控对象；ChatGPT 失焦时自动跟随当前工作的 root，没有工作时保持最近监控 root。QTA 仍按账号级 rate-limit 数据读取。
 4. 未获取到真实数据时面板显示 `—`，数据源缺失会在悬浮提示中标记，不会填充模拟百分比。
 
 CTX 使用当前/最近 token usage 与 model context window 计算剩余比例；QTA 使用 Codex rate-limit window 的 `usedPercent` 计算剩余比例。所有字段都按可选字段处理，以兼容不同 Codex CLI 版本。

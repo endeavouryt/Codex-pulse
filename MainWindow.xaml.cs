@@ -85,7 +85,11 @@ public partial class MainWindow : Window
         _isRefreshing = true;
         try
         {
-            var snapshot = await _dataService.ReadAsync(CancellationToken.None);
+            var snapshot = await _dataService.ReadAsync(
+                CancellationToken.None,
+                _presenceMonitor.IsFocused,
+                _presenceMonitor.FocusedProcessId,
+                _presenceMonitor.LastUserInputUtc);
             ApplySnapshot(snapshot);
         }
         catch (Exception ex)

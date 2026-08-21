@@ -9,6 +9,7 @@ internal sealed class CodexDataService : IDisposable
     private readonly AppServerProvider _appServerProvider;
     private readonly LocalStateProvider _localStateProvider;
     private readonly SessionMonitorState _sessionMonitor = new();
+    private readonly CodexDesktopFocusTracker _desktopFocusTracker = new();
 
     public CodexDataService()
     {
@@ -16,17 +17,28 @@ internal sealed class CodexDataService : IDisposable
         _localStateProvider = new LocalStateProvider(GetCodexHomeCandidates);
     }
 
-    public async Task<PulseSnapshot> ReadAsync(CancellationToken cancellationToken)
+    public async Task<PulseSnapshot> ReadAsync(
+        CancellationToken cancellationToken,
+        bool chatGptFocused = false,
+        int? foregroundProcessId = null,
+        DateTimeOffset? userInputAtUtc = null)
     {
+        // Resolve the selected desktop conversation before loading candidates so
+        // an older window can be added to the local-session read set.
+        var focusedSessionId = chatGptFocused
+            ? _desktopFocusTracker.ReadFocusedSessionId(foregroundProcessId, userInputAtUtc)
+            : null;
         var appTask = _appServerProvider.ReadAsync(cancellationToken);
-        var localTask = _localStateProvider.ReadAsync(cancellationToken);
+        var localTask = _localStateProvider.ReadAsync(cancellationToken, focusedSessionId);
 
         await Task.WhenAll(appTask, localTask).ConfigureAwait(false);
         var app = await appTask.ConfigureAwait(false);
         var local = await localTask.ConfigureAwait(false);
 
-        var candidates = MergeSessions(app.Sessions, local.Sessions);
-        var selected = _sessionMonitor.Select(candidates);
+        var allSessions = MergeSessions(app.Sessions, local.Sessions);
+        var candidates = SessionHierarchy.CollapseToRootSessions(allSessions);
+        var focusedRootSessionId = SessionHierarchy.FindRootSessionId(focusedSessionId, allSessions);
+        var selected = _sessionMonitor.Select(candidates, chatGptFocused, focusedRootSessionId);
         var context = selected?.ContextRemainingPercent;
         var quota = app.QuotaRemainingPercent ?? local.QuotaRemainingPercent;
         var status = selected?.Status ?? PulseStatus.Idle;
@@ -113,11 +125,12 @@ internal sealed class CodexDataService : IDisposable
 
     private static SessionObservation Combine(SessionObservation first, SessionObservation second)
     {
-        var status = first.Status == PulseStatus.Working || second.Status == PulseStatus.Working
-            ? PulseStatus.Working
-            : first.Status == PulseStatus.Completed || second.Status == PulseStatus.Completed
-                ? PulseStatus.Completed
-                : PulseStatus.Idle;
+        // Both providers can report the same thread. Prefer the status with
+        // the newer status timestamp; an old app-server "working" snapshot
+        // must not keep a completed local rollout spinning forever.
+        var firstStatusAt = first.StatusAt ?? first.LastActivityAt;
+        var secondStatusAt = second.StatusAt ?? second.LastActivityAt;
+        var latestStatus = secondStatusAt >= firstStatusAt ? second : first;
         var sourceName = string.Join(
             " + ",
             new[] { first.SourceName, second.SourceName }
@@ -127,7 +140,9 @@ internal sealed class CodexDataService : IDisposable
         return new SessionObservation
         {
             SessionId = first.SessionId,
-            Status = status,
+            ParentSessionId = first.ParentSessionId ?? second.ParentSessionId,
+            CreatedAt = Max(first.CreatedAt, second.CreatedAt),
+            Status = latestStatus.Status,
             StatusAt = Max(first.StatusAt, second.StatusAt),
             LastActivityAt = first.LastActivityAt >= second.LastActivityAt
                 ? first.LastActivityAt
