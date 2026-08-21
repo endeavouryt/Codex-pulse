@@ -2,6 +2,10 @@
 
 Codex Pulse 是一个 Windows 11 优先的极简悬浮状态面板 MVP。默认窗口约为 `128×64` DIP，支持置顶、无边框、拖动和位置持久化。
 
+## 开发声明
+
+本项目完全依赖 Codex 的 vibe coding 工作流完成。项目的代码、架构、功能实现、调试、视觉迭代和文档均由 Codex 根据需求持续生成和修改；人类主要负责提出需求、运行验证、人工比较和最终取舍。
+
 ## 运行
 
 需要安装 .NET 6 Windows Desktop Runtime。开发机有 .NET SDK 时：
