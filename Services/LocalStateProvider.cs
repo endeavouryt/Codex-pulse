@@ -8,12 +8,15 @@ namespace CodexPulse.Services;
 internal sealed class LocalStateProvider
 {
     private const int MaxTailBytes = 1024 * 1024;
-    private const int MaxTaskEventProbeBytes = 8 * 1024 * 1024;
+    private const int MaxTaskEventProbeBytes = 128 * 1024 * 1024;
+    private const int TaskEventScanOverlapBytes = 64 * 1024;
     private const int MetadataProbeBytes = 64 * 1024;
     private const int MaxPreferredSessionFiles = 64;
     private static readonly TimeSpan CompletedDisplayWindow = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan StaleActiveWindow = TimeSpan.FromMinutes(30);
     private readonly Func<IEnumerable<string>> _codexHomeProvider;
+    private readonly Dictionary<string, TaskEventCache> _taskEventCache =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public LocalStateProvider(Func<IEnumerable<string>> codexHomeProvider)
     {
@@ -318,7 +321,7 @@ internal sealed class LocalStateProvider
         return new SessionMetadata(file, sessionId, parentSessionId);
     }
 
-    private static LocalFileObservation? ReadFile(FileInfo file, CancellationToken cancellationToken)
+    private LocalFileObservation? ReadFile(FileInfo file, CancellationToken cancellationToken)
     {
         try
         {
@@ -334,7 +337,7 @@ internal sealed class LocalStateProvider
             double? contextRemaining = null;
             double? quotaRemaining = null;
             var lastActivityAt = new DateTimeOffset(file.LastWriteTimeUtc);
-            var sawTaskEvent = false;
+            TaskEvent? latestTailTaskEvent = null;
 
             foreach (var line in ReadTailLines(file.FullName))
             {
@@ -376,18 +379,18 @@ internal sealed class LocalStateProvider
                     var payloadType = JsonHelpers.TryGetString(payload, "type");
                     if (string.Equals(payloadType, "task_started", StringComparison.OrdinalIgnoreCase))
                     {
-                        sawTaskEvent = true;
-                        if (!taskStartedAt.HasValue || timestamp >= taskStartedAt)
+                        var taskEvent = new TaskEvent(timestamp, IsStarted: true);
+                        if (!latestTailTaskEvent.HasValue || timestamp >= latestTailTaskEvent.Value.Timestamp)
                         {
-                            taskStartedAt = timestamp;
+                            latestTailTaskEvent = taskEvent;
                         }
                     }
                     else if (string.Equals(payloadType, "task_complete", StringComparison.OrdinalIgnoreCase))
                     {
-                        sawTaskEvent = true;
-                        if (!taskCompletedAt.HasValue || timestamp >= taskCompletedAt)
+                        var taskEvent = new TaskEvent(timestamp, IsStarted: false);
+                        if (!latestTailTaskEvent.HasValue || timestamp >= latestTailTaskEvent.Value.Timestamp)
                         {
-                            taskCompletedAt = timestamp;
+                            latestTailTaskEvent = taskEvent;
                         }
                     }
                     else if (string.Equals(payloadType, "token_count", StringComparison.OrdinalIgnoreCase))
@@ -412,22 +415,21 @@ internal sealed class LocalStateProvider
                 }
             }
 
-            // Large rollout output can push the current task_started marker
-            // outside the normal token tail. Probe a larger recent tail for the
-            // latest lifecycle marker while the file is still being written.
-            if (!sawTaskEvent &&
-                DateTime.UtcNow - file.LastWriteTimeUtc <= StaleActiveWindow)
+            // Large rollout output can push the current lifecycle marker outside
+            // the normal token tail. Keep the latest marker per file and only
+            // scan the initial probe or newly appended bytes when necessary.
+            var latestTaskEvent = ReadLatestTaskEvent(
+                file,
+                latestTailTaskEvent,
+                cancellationToken);
+            if (latestTaskEvent.HasValue)
             {
-                var latestTaskEvent = ReadLatestTaskEvent(file.FullName, cancellationToken);
-                if (latestTaskEvent.HasValue)
-                {
-                    taskStartedAt = latestTaskEvent.Value.IsStarted
-                        ? latestTaskEvent.Value.Timestamp
-                        : null;
-                    taskCompletedAt = latestTaskEvent.Value.IsStarted
-                        ? null
-                        : latestTaskEvent.Value.Timestamp;
-                }
+                taskStartedAt = latestTaskEvent.Value.IsStarted
+                    ? latestTaskEvent.Value.Timestamp
+                    : null;
+                taskCompletedAt = latestTaskEvent.Value.IsStarted
+                    ? null
+                    : latestTaskEvent.Value.Timestamp;
             }
 
             PulseStatus status;
@@ -494,44 +496,56 @@ internal sealed class LocalStateProvider
         return JsonHelpers.ClampPercent((window.Value - usage.Value) / window.Value * 100d);
     }
 
-    private static TaskEvent? ReadLatestTaskEvent(
-        string path,
+    private TaskEvent? ReadLatestTaskEvent(
+        FileInfo file,
+        TaskEvent? latestTailTaskEvent,
         CancellationToken cancellationToken)
     {
         try
         {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
+            file.Refresh();
+            var currentLength = file.Length;
+            var currentWriteTime = file.LastWriteTimeUtc;
+            _taskEventCache.TryGetValue(file.FullName, out var cache);
 
-            var lowerBound = Math.Max(0L, stream.Length - MaxTaskEventProbeBytes);
-            stream.Seek(lowerBound, SeekOrigin.Begin);
-            using var reader = new StreamReader(
-                stream,
-                Encoding.UTF8,
-                detectEncodingFromByteOrderMarks: false,
-                bufferSize: 64 * 1024);
-            if (lowerBound > 0)
+            if (cache is null || currentLength < cache.ScannedLength)
             {
-                // Discard the partial line created by seeking into the file.
-                reader.ReadLine();
-            }
-
-            TaskEvent? latestTaskEvent = null;
-            while (!reader.EndOfStream)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var line = reader.ReadLine();
-                if (line is not null &&
-                    TryReadTaskEvent(line, out var taskEvent))
+                // A first read of a large rollout may need to look well beyond
+                // the ordinary tail. Once found, later refreshes are incremental.
+                var initialTaskEvent = latestTailTaskEvent;
+                if (!initialTaskEvent.HasValue &&
+                    DateTime.UtcNow - currentWriteTime <= StaleActiveWindow)
                 {
-                    latestTaskEvent = taskEvent;
+                    initialTaskEvent = ReadTaskEvents(
+                        file.FullName,
+                        Math.Max(0L, currentLength - MaxTaskEventProbeBytes),
+                        currentLength,
+                        cancellationToken);
                 }
+
+                cache = new TaskEventCache(currentLength, currentWriteTime, initialTaskEvent);
+                _taskEventCache[file.FullName] = cache;
+                return cache.LatestTaskEvent;
             }
 
-            return latestTaskEvent;
+            if (currentLength > cache.ScannedLength ||
+                currentWriteTime != cache.LastWriteTimeUtc)
+            {
+                var scanStart = Math.Max(0L, cache.ScannedLength - TaskEventScanOverlapBytes);
+                var appendedTaskEvent = ReadTaskEvents(
+                    file.FullName,
+                    scanStart,
+                    currentLength,
+                    cancellationToken);
+                cache.LatestTaskEvent = NewerTaskEvent(cache.LatestTaskEvent, appendedTaskEvent);
+                cache.ScannedLength = currentLength;
+                cache.LastWriteTimeUtc = currentWriteTime;
+            }
+
+            cache.LatestTaskEvent = NewerTaskEvent(cache.LatestTaskEvent, latestTailTaskEvent);
+            cache.ScannedLength = Math.Max(cache.ScannedLength, currentLength);
+            cache.LastWriteTimeUtc = currentWriteTime;
+            return cache.LatestTaskEvent;
         }
         catch (IOException)
         {
@@ -543,6 +557,64 @@ internal sealed class LocalStateProvider
         }
 
         return null;
+    }
+
+    private static TaskEvent? ReadTaskEvents(
+        string path,
+        long start,
+        long end,
+        CancellationToken cancellationToken)
+    {
+        if (end <= start)
+        {
+            return null;
+        }
+
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        stream.Seek(start, SeekOrigin.Begin);
+        using var reader = new StreamReader(
+            stream,
+            Encoding.UTF8,
+            detectEncodingFromByteOrderMarks: false,
+            bufferSize: 64 * 1024);
+        if (start > 0)
+        {
+            // Discard the partial line created by seeking into the file.
+            reader.ReadLine();
+        }
+
+        TaskEvent? latestTaskEvent = null;
+        while (stream.Position < end && !reader.EndOfStream)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var line = reader.ReadLine();
+            if (line is not null && TryReadTaskEvent(line, out var taskEvent) &&
+                (!latestTaskEvent.HasValue || taskEvent.Timestamp >= latestTaskEvent.Value.Timestamp))
+            {
+                latestTaskEvent = taskEvent;
+            }
+        }
+
+        return latestTaskEvent;
+    }
+
+    private static TaskEvent? NewerTaskEvent(TaskEvent? first, TaskEvent? second)
+    {
+        if (!first.HasValue)
+        {
+            return second;
+        }
+
+        if (!second.HasValue)
+        {
+            return first;
+        }
+
+        return second.Value.Timestamp >= first.Value.Timestamp ? second : first;
     }
 
     private static bool TryReadTaskEvent(string line, out TaskEvent taskEvent)
@@ -699,6 +771,23 @@ internal sealed class LocalStateProvider
         string? ParentSessionId);
 
     private readonly record struct TaskEvent(DateTimeOffset Timestamp, bool IsStarted);
+
+    private sealed class TaskEventCache
+    {
+        public TaskEventCache(
+            long scannedLength,
+            DateTime lastWriteTimeUtc,
+            TaskEvent? latestTaskEvent)
+        {
+            ScannedLength = scannedLength;
+            LastWriteTimeUtc = lastWriteTimeUtc;
+            LatestTaskEvent = latestTaskEvent;
+        }
+
+        public long ScannedLength { get; set; }
+        public DateTime LastWriteTimeUtc { get; set; }
+        public TaskEvent? LatestTaskEvent { get; set; }
+    }
 
     private sealed class LocalFileObservation
     {
