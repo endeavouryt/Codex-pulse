@@ -91,7 +91,7 @@ internal sealed class AppServerClient : IDisposable
                         {
                             name = "codex_pulse",
                             title = "Codex Pulse",
-                            version = "0.1.1"
+                            version = "0.1.2"
                         },
                         capabilities = new
                         {

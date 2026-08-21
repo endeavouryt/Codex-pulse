@@ -8,16 +8,16 @@ Codex Pulse 是一个 Windows 11 优先的极简悬浮状态面板 MVP。默认�
 
 ## 运行
 
-需要安装 .NET 6 Windows Desktop Runtime。开发机有 .NET SDK 时：
+Release 提供 self-contained x64 压缩包，无需另外安装 .NET Runtime。若从源码运行，开发机需要 .NET 6 SDK 或 Windows Desktop Runtime：
 
 ```powershell
 dotnet run --project .\CodexPulse.csproj
 ```
 
-发布单文件（当前机器为 x64 时）：
+生成 self-contained 单文件发布包（当前机器为 x64 时）：
 
 ```powershell
-dotnet publish .\CodexPulse.csproj -c Release -r win-x64 --self-contained false
+dotnet publish .\CodexPulse.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
 如果 `codex.exe` 不在 `PATH`，可设置：

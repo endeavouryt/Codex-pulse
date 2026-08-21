@@ -8,6 +8,7 @@ namespace CodexPulse.Services;
 internal sealed class LocalStateProvider
 {
     private const int MaxTailBytes = 1024 * 1024;
+    private const int MaxTaskEventProbeBytes = 8 * 1024 * 1024;
     private const int MetadataProbeBytes = 64 * 1024;
     private const int MaxPreferredSessionFiles = 64;
     private static readonly TimeSpan CompletedDisplayWindow = TimeSpan.FromMinutes(2);
@@ -324,11 +325,16 @@ internal sealed class LocalStateProvider
             var taskStartedAt = default(DateTimeOffset?);
             var taskCompletedAt = default(DateTimeOffset?);
             var lastTokenAt = default(DateTimeOffset?);
-            var sessionId = ExtractSessionId(file.Name);
-            string? parentThreadId = null;
+            // session_meta is written at the beginning of the rollout file, while
+            // task/token events are read from the tail. Keep the hierarchy metadata
+            // from the head so descendants can be folded into their root session.
+            var metadata = ReadSessionMetadata(file, cancellationToken);
+            var sessionId = metadata.SessionId;
+            string? parentThreadId = metadata.ParentSessionId;
             double? contextRemaining = null;
             double? quotaRemaining = null;
             var lastActivityAt = new DateTimeOffset(file.LastWriteTimeUtc);
+            var sawTaskEvent = false;
 
             foreach (var line in ReadTailLines(file.FullName))
             {
@@ -370,6 +376,7 @@ internal sealed class LocalStateProvider
                     var payloadType = JsonHelpers.TryGetString(payload, "type");
                     if (string.Equals(payloadType, "task_started", StringComparison.OrdinalIgnoreCase))
                     {
+                        sawTaskEvent = true;
                         if (!taskStartedAt.HasValue || timestamp >= taskStartedAt)
                         {
                             taskStartedAt = timestamp;
@@ -377,6 +384,7 @@ internal sealed class LocalStateProvider
                     }
                     else if (string.Equals(payloadType, "task_complete", StringComparison.OrdinalIgnoreCase))
                     {
+                        sawTaskEvent = true;
                         if (!taskCompletedAt.HasValue || timestamp >= taskCompletedAt)
                         {
                             taskCompletedAt = timestamp;
@@ -401,6 +409,24 @@ internal sealed class LocalStateProvider
                 catch (JsonException)
                 {
                     // A line can be incomplete while Codex is appending it.
+                }
+            }
+
+            // Large rollout output can push the current task_started marker
+            // outside the normal token tail. Probe a larger recent tail for the
+            // latest lifecycle marker while the file is still being written.
+            if (!sawTaskEvent &&
+                DateTime.UtcNow - file.LastWriteTimeUtc <= StaleActiveWindow)
+            {
+                var latestTaskEvent = ReadLatestTaskEvent(file.FullName, cancellationToken);
+                if (latestTaskEvent.HasValue)
+                {
+                    taskStartedAt = latestTaskEvent.Value.IsStarted
+                        ? latestTaskEvent.Value.Timestamp
+                        : null;
+                    taskCompletedAt = latestTaskEvent.Value.IsStarted
+                        ? null
+                        : latestTaskEvent.Value.Timestamp;
                 }
             }
 
@@ -466,6 +492,101 @@ internal sealed class LocalStateProvider
         }
 
         return JsonHelpers.ClampPercent((window.Value - usage.Value) / window.Value * 100d);
+    }
+
+    private static TaskEvent? ReadLatestTaskEvent(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+
+            var lowerBound = Math.Max(0L, stream.Length - MaxTaskEventProbeBytes);
+            stream.Seek(lowerBound, SeekOrigin.Begin);
+            using var reader = new StreamReader(
+                stream,
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: false,
+                bufferSize: 64 * 1024);
+            if (lowerBound > 0)
+            {
+                // Discard the partial line created by seeking into the file.
+                reader.ReadLine();
+            }
+
+            TaskEvent? latestTaskEvent = null;
+            while (!reader.EndOfStream)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var line = reader.ReadLine();
+                if (line is not null &&
+                    TryReadTaskEvent(line, out var taskEvent))
+                {
+                    latestTaskEvent = taskEvent;
+                }
+            }
+
+            return latestTaskEvent;
+        }
+        catch (IOException)
+        {
+            // The desktop can rotate or append the file while it is read.
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Status remains based on the normal tail when probing is unavailable.
+        }
+
+        return null;
+    }
+
+    private static bool TryReadTaskEvent(string line, out TaskEvent taskEvent)
+    {
+        taskEvent = default;
+        if (!line.Contains("\"event_msg\"", StringComparison.Ordinal) ||
+            (!line.Contains("\"task_started\"", StringComparison.Ordinal) &&
+             !line.Contains("\"task_complete\"", StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(line);
+            var root = document.RootElement;
+            if (!string.Equals(
+                    JsonHelpers.TryGetString(root, "type"),
+                    "event_msg",
+                    StringComparison.Ordinal) ||
+                !JsonHelpers.TryGetProperty(root, out var payload, "payload") ||
+                payload.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            var payloadType = JsonHelpers.TryGetString(payload, "type");
+            var timestamp = JsonHelpers.TryGetTimestamp(root, "timestamp");
+            if (!timestamp.HasValue ||
+                (!string.Equals(payloadType, "task_started", StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(payloadType, "task_complete", StringComparison.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            taskEvent = new TaskEvent(
+                timestamp.Value,
+                string.Equals(payloadType, "task_started", StringComparison.OrdinalIgnoreCase));
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static double? ReadTokenQuota(JsonElement payload)
@@ -576,6 +697,8 @@ internal sealed class LocalStateProvider
         FileInfo File,
         string SessionId,
         string? ParentSessionId);
+
+    private readonly record struct TaskEvent(DateTimeOffset Timestamp, bool IsStarted);
 
     private sealed class LocalFileObservation
     {
