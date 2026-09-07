@@ -23,7 +23,6 @@ public partial class App : WpfApplication
         }
 
         base.OnStartup(e);
-        new StartupSettings().EnsureApplied();
         MainWindow = new MainWindow();
         MainWindow.Show();
     }

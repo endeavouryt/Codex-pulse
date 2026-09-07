@@ -44,7 +44,7 @@ internal sealed class AppServerProvider
             var threadGraph = await ReadThreadGraphAsync(threads, cancellationToken).ConfigureAwait(false);
             var sessions = ReadSessions(threadGraph, out var status, out var statusKnown, out var statusAt, out var statusDetail);
 
-            var quota = rateLimits.HasValue ? ReadQuotaRemaining(rateLimits.Value) : null;
+            var quota = rateLimits.HasValue ? JsonHelpers.ReadQuotaWindows(rateLimits.Value) : new QuotaWindows();
             var context = sessions.Count == 1 ? sessions[0].ContextRemainingPercent : null;
 
             var details = new List<string> { "app-server" };
@@ -67,7 +67,7 @@ internal sealed class AppServerProvider
             {
                 ProviderAvailable = true,
                 ContextRemainingPercent = context,
-                QuotaRemainingPercent = quota,
+                Quotas = quota,
                 Status = status,
                 StatusKnown = statusKnown,
                 StatusAt = statusAt,
@@ -525,35 +525,6 @@ internal sealed class AppServerProvider
         }
 
         return state;
-    }
-
-    private static double? ReadQuotaRemaining(JsonElement result)
-    {
-        if (JsonHelpers.TryGetProperty(result, out var byLimitId, "rateLimitsByLimitId", "rate_limits_by_limit_id") &&
-            byLimitId.ValueKind == JsonValueKind.Object)
-        {
-            if (byLimitId.TryGetProperty("codex", out var codexSnapshot))
-            {
-                var remaining = JsonHelpers.ReadRemainingPercent(codexSnapshot);
-                if (remaining.HasValue)
-                {
-                    return remaining;
-                }
-            }
-
-            foreach (var property in byLimitId.EnumerateObject())
-            {
-                var remaining = JsonHelpers.ReadRemainingPercent(property.Value);
-                if (remaining.HasValue)
-                {
-                    return remaining;
-                }
-            }
-        }
-
-        return JsonHelpers.TryGetProperty(result, out var snapshot, "rateLimits", "rate_limits")
-            ? JsonHelpers.ReadRemainingPercent(snapshot)
-            : null;
     }
 
     private static ProviderObservation Missing(string detail)

@@ -1,6 +1,6 @@
 # Codex Pulse
 
-Codex Pulse 是一个 Windows 11 优先的极简悬浮状态面板 MVP。默认窗口约为 `128×64` DIP，支持置顶、无边框、拖动和位置持久化。
+Codex Pulse 是一个 Windows 11 优先的极简悬浮状态面板 MVP。默认窗口约为 `124×64`（关闭 5hr 显示时为 `124×44`） DIP，支持置顶、无边框、拖动和位置持久化。
 
 ## 开发声明
 
@@ -37,13 +37,11 @@ CTX 使用当前/最近 token usage 与 model context window 计算剩余比例�
 
 窗口位置保存在 `%LOCALAPPDATA%\CodexPulse\window.json`。首次运行默认使用当前主屏幕工作区右下角（右 30px、下 24px），拖动结束后立即保存；显示器布局变化后会自动限制到可见区域。右键面板可以手动刷新或退出。
 
-默认通过 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\CodexPulse` 随 Windows 用户登录启动。Pulse 不修改 ChatGPT，会每 2 秒检测 `ChatGPT`/`ChatGPTDesktop` 进程：ChatGPT 运行时显示，退出后隐藏但保留后台进程。以后可在 `%LOCALAPPDATA%\CodexPulse\settings.json` 写入以下配置关闭自启动：
+右键面板提供“显示 5hr limit”和“开机启动”两个勾选项。前者默认开启，关闭后仅显示 weekly limit 和右侧状态圈；选择保存在 `%LOCALAPPDATA%\CodexPulse\settings.json` 的 `showFiveHour` 字段。后者默认关闭，仅在用户勾选时将当前程序注册到 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\CodexPulse`，取消勾选即删除。启动程序不会主动注册；菜单以实际注册状态为准，旧 `startWithWindows` 配置不再生效。移动程序后需重新勾选以更新路径。
 
-```json
-{
-  "startWithWindows": false
-}
-```
+Pulse 不修改 ChatGPT，每 2 秒检测 `ChatGPT`/`ChatGPTDesktop` 进程：ChatGPT 运行时显示，退出后隐藏但保留后台进程。
+
+本地实验版恢复最初的两行布局：左侧 5 hr / Week（统一 14 DIP 等宽字体），旁边显示剩余百分比，右侧保留空闲圆圈、工作旋转圈和完成勾号。CTX 和重置时间放在悬浮提示中。按额度窗口时长识别 300 分钟 / 10080 分钟；数据缺失显示 `—`，不会自动隐藏行。无 5hr 限制的用户可在右键菜单关闭该行。
 
 浅色面板使用 Windows 11 DWM transient-window backdrop 作为实际背景模糊，再叠加低透明度白色玻璃层；旧系统会退回到轻量 WPF 表面。
 

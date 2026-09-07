@@ -27,7 +27,7 @@ public sealed class ProviderObservation
 {
     public bool ProviderAvailable { get; init; }
     public double? ContextRemainingPercent { get; init; }
-    public double? QuotaRemainingPercent { get; init; }
+    public QuotaWindows Quotas { get; init; } = new();
     public PulseStatus Status { get; init; } = PulseStatus.Idle;
     public bool StatusKnown { get; init; }
     public DateTimeOffset? StatusAt { get; init; }
@@ -40,7 +40,7 @@ public sealed class ProviderObservation
 public sealed class PulseSnapshot
 {
     public double? ContextRemainingPercent { get; init; }
-    public double? QuotaRemainingPercent { get; init; }
+    public QuotaWindows Quotas { get; init; } = new();
     public PulseStatus Status { get; init; } = PulseStatus.Idle;
     public DateTimeOffset? StatusAt { get; init; }
     public string SourceName { get; init; } = "NO DATA";
@@ -50,6 +50,18 @@ public sealed class PulseSnapshot
     public bool AutoFollow { get; init; } = true;
 
     public bool HasContext => ContextRemainingPercent.HasValue;
-    public bool HasQuota => QuotaRemainingPercent.HasValue;
+    public bool HasQuota => Quotas.HasValue;
     public bool HasMetrics => HasContext || HasQuota;
+}
+
+public sealed class QuotaWindow
+{
+    public double? RemainingPercent { get; init; }
+    public DateTimeOffset? ResetsAt { get; init; }
+}
+public sealed class QuotaWindows
+{
+    public QuotaWindow? FiveHour { get; init; }
+    public QuotaWindow? Weekly { get; init; }
+    public bool HasValue => FiveHour?.RemainingPercent.HasValue == true || Weekly?.RemainingPercent.HasValue == true;
 }

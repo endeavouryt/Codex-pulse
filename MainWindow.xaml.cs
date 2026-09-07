@@ -16,21 +16,25 @@ public partial class MainWindow : Window
     private readonly ChatGptPresenceMonitor _presenceMonitor = new();
     private readonly TrayIconService _trayIcon;
     private readonly DispatcherTimer _refreshTimer;
-    private readonly DoubleAnimation _spinnerAnimation;
+    private readonly PulseSettings _settings = new();
+    private readonly DoubleAnimation _spinnerAnimation = new(0, 360, TimeSpan.FromSeconds(1.05))
+    {
+        RepeatBehavior = RepeatBehavior.Forever,
+        EasingFunction = new CircleEase { EasingMode = EasingMode.EaseInOut }
+    };
+    private PulseStatus? _lastStatus;
     private bool _isRefreshing;
     private bool _placementRestored;
-    private PulseStatus? _lastStatus;
 
     public MainWindow()
     {
         InitializeComponent();
+        ShowFiveHourMenuItem.IsChecked = _settings.ShowFiveHour;
+        StartupMenuItem.IsChecked = StartupSettings.IsEnabled;
+        ApplyQuotaLayout();
+        SizeChanged += (_, _) => ApplyRoundedWindowRegion();
+        GlassCard.ContextMenu.Opened += (_, _) => StartupMenuItem.IsChecked = StartupSettings.IsEnabled;
         _trayIcon = new TrayIconService(this);
-
-        _spinnerAnimation = new DoubleAnimation(0, 360, TimeSpan.FromSeconds(1.05))
-        {
-            RepeatBehavior = RepeatBehavior.Forever,
-            EasingFunction = new CircleEase { EasingMode = EasingMode.EaseInOut }
-        };
 
         _refreshTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -124,8 +128,8 @@ public partial class MainWindow : Window
 
     private void ApplySnapshot(PulseSnapshot snapshot)
     {
-        ContextValueText.Text = FormatPercent(snapshot.ContextRemainingPercent);
-        QuotaValueText.Text = FormatPercent(snapshot.QuotaRemainingPercent);
+        FiveHourValueText.Text = FormatPercent(snapshot.Quotas.FiveHour?.RemainingPercent);
+        WeeklyValueText.Text = FormatPercent(snapshot.Quotas.Weekly?.RemainingPercent);
 
         SetStatusIcon(snapshot.Status);
         PulseToolTip.Content = BuildToolTip(snapshot);
@@ -154,7 +158,8 @@ public partial class MainWindow : Window
     private static string BuildToolTip(PulseSnapshot snapshot)
     {
         var ctx = FormatPercent(snapshot.ContextRemainingPercent);
-        var qta = FormatPercent(snapshot.QuotaRemainingPercent);
+        var five = FormatPercent(snapshot.Quotas.FiveHour?.RemainingPercent);
+        var week = FormatPercent(snapshot.Quotas.Weekly?.RemainingPercent);
         var status = snapshot.Status switch
         {
             PulseStatus.Working => "工作中",
@@ -162,7 +167,7 @@ public partial class MainWindow : Window
             _ => "无任务"
         };
 
-        return $"Codex Pulse\nCTX {ctx} · QTA {qta}\n状态：{status}\n来源：{snapshot.SourceName}\n{snapshot.Detail}";
+        return $"Codex Pulse\nCTX {ctx}\n5h remaining {five} · Reset: {snapshot.Quotas.FiveHour?.ResetsAt?.ToLocalTime().ToString("g") ?? "—"}\nWeekly remaining {week} · Reset: {snapshot.Quotas.Weekly?.ResetsAt?.ToLocalTime().ToString("g") ?? "—"}\n状态：{status}\n来源：{snapshot.SourceName}\n{snapshot.Detail}";
     }
 
     private void GlassCard_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -184,6 +189,43 @@ public partial class MainWindow : Window
     private async void RefreshMenuItem_Click(object sender, RoutedEventArgs e)
     {
         await RefreshAsync();
+    }
+
+    private void ApplyQuotaLayout()
+    {
+        var visible = _settings.ShowFiveHour;
+        FiveHourRow.Height = visible ? new GridLength(1, GridUnitType.Star) : new GridLength(0);
+        FiveHourLabel.Visibility = FiveHourValueText.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        Height = visible ? 64 : 44;
+    }
+
+    private void ShowFiveHourMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _settings.SetShowFiveHour(ShowFiveHourMenuItem.IsChecked);
+            ApplyQuotaLayout();
+            if (_placementRestored)
+            {
+                _placementStore.Save(this);
+                _placementStore.Restore(this);
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowFiveHourMenuItem.IsChecked = _settings.ShowFiveHour;
+            System.Windows.MessageBox.Show(this, $"设置保存失败：{ex.Message}", "Codex Pulse");
+        }
+    }
+
+    private void StartupMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        try { StartupSettings.SetEnabled(StartupMenuItem.IsChecked); }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(this, $"开机启动设置失败：{ex.Message}", "Codex Pulse");
+        }
+        StartupMenuItem.IsChecked = StartupSettings.IsEnabled;
     }
 
     private void ExitMenuItem_Click(object sender, RoutedEventArgs e)

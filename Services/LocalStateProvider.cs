@@ -126,10 +126,10 @@ internal sealed class LocalStateProvider
             .OrderByDescending(item => item.StatusAt ?? item.LastActivityAt)
             .FirstOrDefault();
         var metricObservation = (active is not null &&
-                                 (active.ContextRemainingPercent.HasValue || active.QuotaRemainingPercent.HasValue)
+                                 (active.ContextRemainingPercent.HasValue || active.Quotas.HasValue)
                 ? active
                 : sessionObservations
-                .Where(item => item.ContextRemainingPercent.HasValue || item.QuotaRemainingPercent.HasValue)
+                .Where(item => item.ContextRemainingPercent.HasValue || item.Quotas.HasValue)
                 .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
                 .FirstOrDefault()) ?? sessionObservations.OrderByDescending(item => item.LastActivityAt).First();
 
@@ -150,7 +150,9 @@ internal sealed class LocalStateProvider
         {
             ProviderAvailable = true,
             ContextRemainingPercent = metricObservation.ContextRemainingPercent,
-            QuotaRemainingPercent = metricObservation.QuotaRemainingPercent,
+            Quotas = observations.Where(item => item.Quotas.HasValue)
+                .OrderByDescending(item => item.LastQuotaAt ?? item.LastActivityAt)
+                .FirstOrDefault()?.Quotas ?? new(),
             Status = status,
             StatusKnown = statusKnown,
             StatusAt = statusObservation?.StatusAt,
@@ -191,7 +193,7 @@ internal sealed class LocalStateProvider
                     .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
                     .FirstOrDefault();
                 var latestQuota = items
-                    .Where(item => item.QuotaRemainingPercent.HasValue)
+                    .Where(item => item.Quotas.HasValue)
                     .OrderByDescending(item => item.LastTokenAt ?? item.LastActivityAt)
                     .FirstOrDefault();
                 var latestWork = items
@@ -214,7 +216,7 @@ internal sealed class LocalStateProvider
                         .FirstOrDefault(),
                     WorkStartedAt = latestWork?.WorkStartedAt,
                     ContextRemainingPercent = latestContext?.ContextRemainingPercent,
-                    QuotaRemainingPercent = latestQuota?.QuotaRemainingPercent,
+                    Quotas = latestQuota?.Quotas ?? new(),
                     Status = latestStatus.Status,
                     StatusAt = latestStatus.StatusAt
                 };
@@ -328,6 +330,7 @@ internal sealed class LocalStateProvider
             var taskStartedAt = default(DateTimeOffset?);
             var taskCompletedAt = default(DateTimeOffset?);
             var lastTokenAt = default(DateTimeOffset?);
+            var lastQuotaAt = default(DateTimeOffset?);
             // session_meta is written at the beginning of the rollout file, while
             // task/token events are read from the tail. Keep the hierarchy metadata
             // from the head so descendants can be folded into their root session.
@@ -335,7 +338,7 @@ internal sealed class LocalStateProvider
             var sessionId = metadata.SessionId;
             string? parentThreadId = metadata.ParentSessionId;
             double? contextRemaining = null;
-            double? quotaRemaining = null;
+            QuotaWindows quotaRemaining = new();
             var lastActivityAt = new DateTimeOffset(file.LastWriteTimeUtc);
             TaskEvent? latestTailTaskEvent = null;
 
@@ -406,6 +409,7 @@ internal sealed class LocalStateProvider
                         if (tokenQuota.HasValue)
                         {
                             quotaRemaining = tokenQuota;
+                            lastQuotaAt = timestamp;
                         }
                     }
                 }
@@ -459,9 +463,10 @@ internal sealed class LocalStateProvider
                 ParentSessionId = parentThreadId,
                 LastActivityAt = lastActivityAt,
                 LastTokenAt = lastTokenAt,
+                LastQuotaAt = lastQuotaAt,
                 WorkStartedAt = taskStartedAt,
                 ContextRemainingPercent = contextRemaining,
-                QuotaRemainingPercent = quotaRemaining,
+                Quotas = quotaRemaining,
                 Status = status,
                 StatusAt = statusAt
             };
@@ -661,26 +666,10 @@ internal sealed class LocalStateProvider
         }
     }
 
-    private static double? ReadTokenQuota(JsonElement payload)
+    private static QuotaWindows ReadTokenQuota(JsonElement payload)
     {
-        if (!JsonHelpers.TryGetProperty(payload, out var limits, "rate_limits", "rateLimits") ||
-            limits.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        if (JsonHelpers.TryGetProperty(limits, out var byLimitId, "rate_limits_by_limit_id", "rateLimitsByLimitId") &&
-            byLimitId.ValueKind == JsonValueKind.Object &&
-            byLimitId.TryGetProperty("codex", out var codexSnapshot))
-        {
-            var codexRemaining = JsonHelpers.ReadRemainingPercent(codexSnapshot);
-            if (codexRemaining.HasValue)
-            {
-                return codexRemaining;
-            }
-        }
-
-        return JsonHelpers.ReadRemainingPercent(limits);
+        return JsonHelpers.TryGetProperty(payload, out var limits, "rate_limits", "rateLimits")
+            ? JsonHelpers.ReadQuotaWindows(limits) : new QuotaWindows();
     }
 
     private static IEnumerable<string> ReadTailLines(string path)
@@ -796,9 +785,10 @@ internal sealed class LocalStateProvider
         public string? ParentSessionId { get; init; }
         public DateTimeOffset LastActivityAt { get; init; }
         public DateTimeOffset? LastTokenAt { get; init; }
+        public DateTimeOffset? LastQuotaAt { get; init; }
         public DateTimeOffset? WorkStartedAt { get; init; }
         public double? ContextRemainingPercent { get; init; }
-        public double? QuotaRemainingPercent { get; init; }
+        public QuotaWindows Quotas { get; init; } = new();
         public PulseStatus Status { get; init; }
         public DateTimeOffset? StatusAt { get; init; }
     }

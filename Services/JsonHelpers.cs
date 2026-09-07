@@ -96,35 +96,28 @@ internal static class JsonHelpers
         return usedPercent.HasValue ? ClampPercent(100d - usedPercent.Value) : null;
     }
 
-    public static double? ReadRemainingPercent(JsonElement snapshot)
+    public static CodexPulse.Models.QuotaWindows ReadQuotaWindows(JsonElement snapshot)
     {
-        var candidates = new List<double>();
-
-        if (TryGetProperty(snapshot, out var individualLimit, "individualLimit", "individual_limit") &&
-            individualLimit.ValueKind == JsonValueKind.Object)
+        if (TryGetProperty(snapshot, out var buckets, "rateLimitsByLimitId", "rate_limits_by_limit_id") &&
+            buckets.ValueKind == JsonValueKind.Object && buckets.TryGetProperty("codex", out var codex))
+            return ReadQuotaWindows(codex);
+        if (TryGetProperty(snapshot, out var nested, "rateLimits", "rate_limits"))
+            return ReadQuotaWindows(nested);
+        CodexPulse.Models.QuotaWindow? fiveHour = null, weekly = null;
+        foreach (var name in new[] { "primary", "secondary" })
         {
-            var individualRemaining = TryGetNumber(individualLimit, "remainingPercent", "remaining_percent");
-            if (individualRemaining.HasValue)
+            if (!TryGetProperty(snapshot, out var window, name)) continue;
+            var minutes = TryGetNumber(window, "windowDurationMins", "window_duration_mins", "window_minutes");
+            // Duration identifies the window even when primary/secondary are reordered.
+            var value = new CodexPulse.Models.QuotaWindow
             {
-                candidates.Add(individualRemaining.Value);
-            }
+                RemainingPercent = RemainingPercentFromUsed(TryGetNumber(window, "usedPercent", "used_percent")),
+                ResetsAt = TryGetTimestamp(window, "resetsAt", "resets_at")
+            };
+            if (minutes == 300) fiveHour = value;
+            else if (minutes == 10080) weekly = value;
         }
-
-        foreach (var windowName in new[] { "primary", "secondary" })
-        {
-            if (!TryGetProperty(snapshot, out var window, windowName) || window.ValueKind != JsonValueKind.Object)
-            {
-                continue;
-            }
-
-            var remaining = RemainingPercentFromUsed(TryGetNumber(window, "usedPercent", "used_percent"));
-            if (remaining.HasValue)
-            {
-                candidates.Add(remaining.Value);
-            }
-        }
-
-        return candidates.Count == 0 ? null : ClampPercent(candidates.Min());
+        return new CodexPulse.Models.QuotaWindows { FiveHour = fiveHour, Weekly = weekly };
     }
 
     public static double? ReadContextRemaining(JsonElement tokenUsage)

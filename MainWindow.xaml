@@ -2,10 +2,10 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Codex Pulse"
-        Width="128"
+        Width="124"
         Height="64"
-        MinWidth="128"
-        MinHeight="64"
+        MinWidth="124"
+        MinHeight="44"
         WindowStyle="None"
         ResizeMode="NoResize"
         AllowsTransparency="False"
@@ -37,29 +37,33 @@
             <ContextMenu>
                 <MenuItem Header="立即刷新" Click="RefreshMenuItem_Click" />
                 <Separator />
+                <MenuItem x:Name="ShowFiveHourMenuItem" Header="显示 5hr limit" IsCheckable="True" IsChecked="True" Click="ShowFiveHourMenuItem_Click" />
+                <MenuItem x:Name="StartupMenuItem" Header="开机启动" IsCheckable="True" Click="StartupMenuItem_Click" />
+                <Separator />
                 <MenuItem Header="退出 Codex Pulse" Click="ExitMenuItem_Click" />
             </ContextMenu>
         </Grid.ContextMenu>
 
-        <Grid Margin="11,7,9,7">
+        <Grid Margin="6,7,5,7">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="6" />
+                    <ColumnDefinition Width="36" />
+                    <ColumnDefinition Width="4" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
-                    <RowDefinition Height="*" />
+                    <RowDefinition x:Name="FiveHourRow" Height="*" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
 
                 <TextBlock Grid.Row="0"
-                           Text="CTX"
-                           FontSize="9"
+                           x:Name="FiveHourLabel" Text="5 hr"
+                           FontFamily="Consolas"
+                           FontSize="14"
                            FontWeight="SemiBold"
                            Foreground="#71808E"
                            VerticalAlignment="Center" />
-                <TextBlock x:Name="ContextValueText"
+                <TextBlock x:Name="FiveHourValueText"
                            Grid.Row="0"
                            Grid.Column="2"
                            Text="—"
@@ -69,12 +73,13 @@
                            VerticalAlignment="Center" />
 
                 <TextBlock Grid.Row="1"
-                           Text="QTA"
-                           FontSize="9"
+                           Text="Week"
+                           FontFamily="Consolas"
+                           FontSize="14"
                            FontWeight="SemiBold"
                            Foreground="#71808E"
                            VerticalAlignment="Center" />
-                <TextBlock x:Name="QuotaValueText"
+                <TextBlock x:Name="WeeklyValueText"
                            Grid.Row="1"
                            Grid.Column="2"
                            Text="—"

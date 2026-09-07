@@ -40,17 +40,21 @@ internal sealed class CodexDataService : IDisposable
         var focusedRootSessionId = SessionHierarchy.FindRootSessionId(focusedSessionId, allSessions);
         var selected = _sessionMonitor.Select(candidates, chatGptFocused, focusedRootSessionId);
         var context = selected?.ContextRemainingPercent;
-        var quota = app.QuotaRemainingPercent ?? local.QuotaRemainingPercent;
+        var quota = new QuotaWindows
+        {
+            FiveHour = app.Quotas.FiveHour?.RemainingPercent.HasValue == true ? app.Quotas.FiveHour : local.Quotas.FiveHour,
+            Weekly = app.Quotas.Weekly?.RemainingPercent.HasValue == true ? app.Quotas.Weekly : local.Quotas.Weekly
+        };
         var status = selected?.Status ?? PulseStatus.Idle;
         var statusAt = selected?.StatusAt;
 
         var sources = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         AddSource(sources, selected?.SourceName);
-        if (app.QuotaRemainingPercent.HasValue)
+        if (app.Quotas.HasValue)
         {
             sources.Add("APP");
         }
-        else if (local.QuotaRemainingPercent.HasValue)
+        if (local.Quotas.HasValue && (app.Quotas.FiveHour?.RemainingPercent is null || app.Quotas.Weekly?.RemainingPercent is null))
         {
             sources.Add("FILE");
         }
@@ -75,7 +79,7 @@ internal sealed class CodexDataService : IDisposable
         return new PulseSnapshot
         {
             ContextRemainingPercent = context,
-            QuotaRemainingPercent = quota,
+            Quotas = quota,
             Status = status,
             StatusAt = statusAt,
             SourceName = sources.Count == 0 ? "NO DATA" : string.Join(" + ", sources),
